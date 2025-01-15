@@ -162,6 +162,7 @@ public class VeniceController {
     this.unusedValueSchemaCleanupService = createUnusedValueSchemaCleanupService();
     this.storeGraveyardCleanupService = createStoreGraveyardCleanupService();
     this.systemStoreRepairService = createSystemStoreRepairService();
+    this.deferredVersionSwapService = createDeferredVersionSwapService();
     if (multiClusterConfigs.isGrpcServerEnabled()) {
       initializeGrpcServer();
     }
@@ -271,6 +272,14 @@ public class VeniceController {
     if (multiClusterConfigs.isParent()) {
       Admin admin = controllerService.getVeniceHelixAdmin();
       return Optional.of(new UnusedValueSchemaCleanupService(multiClusterConfigs, (VeniceParentHelixAdmin) admin));
+    }
+    return Optional.empty();
+  }
+
+  private Optional<DeferredVersionSwapService> createDeferredVersionSwapService() {
+    if (multiClusterConfigs.isParent()) {
+      Admin admin = controllerService.getVeniceHelixAdmin();
+      return Optional.of(new DeferredVersionSwapService((VeniceParentHelixAdmin) admin, multiClusterConfigs));
     }
     return Optional.empty();
   }
