@@ -1365,6 +1365,9 @@ public class VeniceParentHelixAdmin implements Admin {
 
       if (onlyDeferredSwap) {
         if (version.getStatus() == STARTED || version.getStatus() == PUSHED) {
+          if (reapStrandedPushIfErrored(clusterName, latestTopicName)) {
+            return Optional.empty();
+          }
           LOGGER.error(
               "Future version {} exists for store {}, please wait till the future version is made current.",
               versionNumber,
@@ -1378,6 +1381,10 @@ public class VeniceParentHelixAdmin implements Admin {
           }
         }
       } else if (isTargetRegionPushWithDeferredSwap) {
+        if ((version.getStatus() == STARTED || version.getStatus() == PUSHED)
+            && reapStrandedPushIfErrored(clusterName, latestTopicName)) {
+          return Optional.empty();
+        }
         LOGGER.error(
             "Future version {} exists for store {}, please wait till the future version is made current.",
             versionNumber,
@@ -1524,6 +1531,17 @@ public class VeniceParentHelixAdmin implements Admin {
 
     if ((lastVersion.getStatus() == STARTED || lastVersion.getStatus() == PUSHED
         || lastVersion.getStatus() == CREATED)) {
+      /**
+       * The parent version status is stranded in a non-terminal state. A push job whose driver died
+       * ungracefully (e.g. its container node was lost) may never have issued a kill, leaving the parent
+       * version status stuck here even though the offline push has already moved to a terminal ERROR. In
+       * that case reap the stranded push and let the incoming push proceed instead of rejecting it as a
+       * concurrent push. A push that merely COMPLETED still blocks here because a deferred version swap
+       * may still need to happen before the future version becomes current.
+       */
+      if (reapStrandedPushIfErrored(clusterName, latestTopic.get())) {
+        return Optional.empty();
+      }
       LOGGER.error(
           "The push for version {} of store {} is not completed, please wait till the push is completed.",
           lastVersionNum,
@@ -1560,6 +1578,65 @@ public class VeniceParentHelixAdmin implements Admin {
       return latestTopic;
     }
     return Optional.empty();
+  }
+
+  /**
+   * Decide whether an incoming push may preempt an existing push whose parent version status is still
+   * non-terminal (e.g. STARTED/PUSHED), by consulting the live offline push status in the child regions.
+   *
+   * <p>A push job's driver can die ungracefully — for example when its container node is lost — without
+   * ever running its kill path. That leaves the parent version status stranded in STARTED even though the
+   * offline push has already moved to a terminal ERROR. Keying off the parent version status alone would
+   * then reject every subsequent push with a spurious {@link ConcurrentBatchPushException} until an
+   * out-of-band cleanup eventually kills the version. Consulting the offline push status lets an incoming
+   * push reap such a stranded push instead.
+   *
+   * <p>Only a terminal {@link ExecutionStatus#ERROR} triggers a reap. A push that merely COMPLETED must
+   * NOT be reaped here: for a deferred-swap version the data is ingested but the version swap is a
+   * deliberate later step, so the future version must be preserved and continue to block new pushes. A
+   * still-running (non-terminal) push likewise continues to block. The status is polled with the same
+   * retry loop the parent uses elsewhere to tolerate transient child-region connectivity blips, and the
+   * status aggregation lets non-terminal statuses take precedence, so a healthy in-flight push (any
+   * region still in progress) is never seen as errored here.
+   *
+   * @return {@code true} only if the existing offline push has terminally ERRORED — in which case it has
+   *         been killed here so the incoming push may proceed; {@code false} otherwise (still running, or
+   *         terminally completed and awaiting a version swap), so it should continue to block the
+   *         incoming push.
+   */
+  private boolean reapStrandedPushIfErrored(String clusterName, String topicName) {
+    final long SLEEP_MS_BETWEEN_RETRY = TimeUnit.SECONDS.toMillis(10);
+    ExecutionStatus jobStatus = ExecutionStatus.PROGRESS;
+    Map<String, String> extraInfo = new HashMap<>();
+    int retryTimes = 5;
+    int current = 0;
+    while (current++ < retryTimes) {
+      OfflinePushStatusInfo offlineJobStatus = getOffLinePushStatus(clusterName, topicName);
+      jobStatus = offlineJobStatus.getExecutionStatus();
+      extraInfo = offlineJobStatus.getExtraInfo();
+      if (!extraInfo.containsValue(ExecutionStatus.UNKNOWN.toString())) {
+        break;
+      }
+      // Retry since there is a connection failure when querying job status against a child region.
+      try {
+        timer.sleep(SLEEP_MS_BETWEEN_RETRY);
+      } catch (InterruptedException e) {
+        currentThread().interrupt();
+        throw new VeniceException("Received InterruptedException during sleep between 'getOffLinePushStatus' calls");
+      }
+    }
+    if (!jobStatus.isError()) {
+      // Still running, or terminally completed (a completed push may still owe a deferred version swap).
+      // Either way, do not reap: the caller keeps blocking the incoming push.
+      return false;
+    }
+    LOGGER.warn(
+        "Offline push for topic: {} is in terminal status {} while its parent version status is still "
+            + "non-terminal; killing the stranded push so the incoming push can proceed.",
+        topicName,
+        jobStatus);
+    killOfflinePush(clusterName, topicName, true);
+    return true;
   }
 
   private boolean validateChildCurrentVersions(String clusterName, String storeName, int lastVersionNum) {
