@@ -25,6 +25,7 @@ import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
@@ -116,6 +117,7 @@ import com.linkedin.venice.utils.TestMockTime;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
+import com.linkedin.venice.utils.locks.AutoCloseableLock;
 import com.linkedin.venice.utils.locks.ClusterLockManager;
 import com.linkedin.venice.views.MaterializedView;
 import com.linkedin.venice.writer.VeniceWriter;
@@ -132,11 +134,14 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.apache.http.HttpStatus;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
@@ -3857,7 +3862,385 @@ public class TestVeniceParentHelixAdmin extends AbstractTestVeniceParentHelixAdm
     verify(mockParentAdmin, never()).getOffLinePushStatus(eq(clusterName), anyString());
   }
 
+  @DataProvider(name = "manualDeferredSwapAdmission")
+  public Object[][] manualDeferredSwapAdmission() {
+    return new Object[][] { { STARTED, 0 }, { STARTED, 1 }, { PUSHED, 0 }, { PUSHED, 1 } };
+  }
+
+  @Test(dataProvider = "manualDeferredSwapAdmission")
+  public void testGetTopicForCurrentPushJobReconcilesManualDeferredSwap(
+      VersionStatus status,
+      int parentCurrentVersion) {
+    prepareDeferredSwapAdmission(status);
+    store.setCurrentVersion(parentCurrentVersion);
+    long promotionTimestamp = store.getLatestVersionPromoteToCurrentTimestamp();
+    int previousCurrentVersion = store.getVersion(1).getPreviousCurrentVersion();
+
+    Assert.assertFalse(parentAdmin.getTopicForCurrentPushJob(clusterName, storeName, false, false).isPresent());
+
+    assertEquals(store.getVersionStatus(1), ONLINE);
+    assertEquals(store.getCurrentVersion(), 1);
+    if (parentCurrentVersion == 1) {
+      assertEquals(store.getLatestVersionPromoteToCurrentTimestamp(), promotionTimestamp);
+      assertEquals(store.getVersion(1).getPreviousCurrentVersion(), previousCurrentVersion);
+    }
+    verify(resources.getStoreMetadataRepository()).updateStore(any(Store.class));
+    for (ControllerClient client: controllerClients.values()) {
+      verify(client).getStore(storeName);
+    }
+  }
+
+  @DataProvider(name = "unverifiedManualDeferredSwaps")
+  public Object[][] unverifiedManualDeferredSwaps() {
+    List<Object[]> cases = new ArrayList<>();
+    List<Map<String, Integer>> results = Arrays.asList(
+        null,
+        Collections.emptyMap(),
+        Collections.singletonMap("region-a", 1),
+        deferredSwapCurrentVersions(1, -1),
+        deferredSwapCurrentVersions(1, 0),
+        deferredSwapCurrentVersions(1, 2),
+        deferredSwapCurrentVersions(1, null));
+    for (VersionStatus status: Arrays.asList(STARTED, PUSHED)) {
+      for (Map<String, Integer> result: results) {
+        cases.add(new Object[] { status, result });
+      }
+    }
+    return cases.toArray(new Object[0][]);
+  }
+
+  @Test(dataProvider = "unverifiedManualDeferredSwaps")
+  public void testGetTopicForCurrentPushJobRequiresCompleteManualSwap(
+      VersionStatus status,
+      Map<String, Integer> currentVersions) {
+    prepareDeferredSwapAdmission(status);
+    store.setCurrentVersion(1);
+    Store original = store.cloneStore();
+    VeniceParentHelixAdmin adminSpy = spy(parentAdmin);
+    doReturn(currentVersions).when(adminSpy).getCurrentVersionsForMultiColos(clusterName, storeName);
+
+    assertEquals(
+        adminSpy.getTopicForCurrentPushJob(clusterName, storeName, false, false),
+        Optional.of(Version.composeKafkaTopic(storeName, 1)));
+    assertEquals(store, original);
+    verify(resources.getStoreMetadataRepository(), never()).updateStore(any(Store.class));
+  }
+
+  @Test(dataProvider = "True-and-False", dataProviderClass = DataProviderUtils.class)
+  public void testGetTopicForCurrentPushJobRequiresExactNonemptyRegions(boolean emptyRegions) {
+    prepareDeferredSwapAdmission(PUSHED);
+    controllerClients.remove("region-b");
+    if (emptyRegions) {
+      controllerClients.clear();
+    }
+    VeniceParentHelixAdmin adminSpy = spy(parentAdmin);
+    doReturn(deferredSwapCurrentVersions(1, 1)).when(adminSpy).getCurrentVersionsForMultiColos(clusterName, storeName);
+
+    assertTrue(adminSpy.getTopicForCurrentPushJob(clusterName, storeName, false, false).isPresent());
+    assertEquals(store.getVersionStatus(1), PUSHED);
+    assertEquals(store.getCurrentVersion(), 0);
+    verify(resources.getStoreMetadataRepository(), never()).updateStore(any(Store.class));
+    if (emptyRegions) {
+      verify(adminSpy, never()).getCurrentVersionsForMultiColos(clusterName, storeName);
+    }
+  }
+
+  @DataProvider(name = "manualDeferredSwapExclusions")
+  public Object[][] manualDeferredSwapExclusions() {
+    return new Object[][] { { STARTED, true, "region-a" }, { PUSHED, true, "region-a" },
+        { VersionStatus.CREATED, true, "" }, { PUSHED, false, "" } };
+  }
+
+  @Test(dataProvider = "manualDeferredSwapExclusions")
+  public void testGetTopicForCurrentPushJobDoesNotReconcileOtherPushes(
+      VersionStatus status,
+      boolean deferred,
+      String targetRegion) {
+    prepareDeferredSwapAdmission(status);
+    store = inProgressStore(storeName, status, deferred, targetRegion);
+
+    assertTrue(parentAdmin.getTopicForCurrentPushJob(clusterName, storeName, false, false).isPresent());
+    verify(resources.getStoreMetadataRepository(), never()).updateStore(any(Store.class));
+    for (ControllerClient client: controllerClients.values()) {
+      verify(client, never()).getStore(storeName);
+    }
+  }
+
+  @DataProvider(name = "changedManualDeferredSwap")
+  public Object[][] changedManualDeferredSwap() {
+    return new Object[][] { { "killed" }, { "error" }, { "rolled-back" }, { "partially-online" }, { "online" },
+        { "pushed" }, { "newer-current" }, { "changed-current" }, { "superseded" }, { "deleted-version" },
+        { "deleted-store" }, { "recreated-store" }, { "replaced-version" }, { "targeted" }, { "non-deferred" },
+        { "changed-regions" } };
+  }
+
+  @Test(dataProvider = "changedManualDeferredSwap")
+  public void testGetTopicForCurrentPushJobDoesNotReconcileChangedParent(String change) {
+    prepareDeferredSwapAdmission(STARTED);
+    VeniceParentHelixAdmin adminSpy = spy(parentAdmin);
+    doAnswer(invocation -> {
+      switch (change) {
+        case "killed":
+          store.updateVersionStatus(1, KILLED);
+          break;
+        case "error":
+          store.updateVersionStatus(1, VersionStatus.ERROR);
+          break;
+        case "rolled-back":
+          store.updateVersionStatus(1, ROLLED_BACK);
+          break;
+        case "partially-online":
+          store.updateVersionStatus(1, VersionStatus.PARTIALLY_ONLINE);
+          break;
+        case "online":
+          store.updateVersionStatus(1, ONLINE);
+          break;
+        case "pushed":
+          store.updateVersionStatus(1, PUSHED);
+          break;
+        case "newer-current":
+          store.setCurrentVersion(2);
+          break;
+        case "changed-current":
+          store.setCurrentVersion(1);
+          break;
+        case "superseded":
+          store.addVersion(new VersionImpl(storeName, 2, "new-push"));
+          break;
+        case "deleted-version":
+          store.deleteVersion(1);
+          break;
+        case "deleted-store":
+          store = null;
+          break;
+        case "recreated-store":
+          store = TestUtils.createTestStore(storeName, "test_owner", 2);
+          store.addVersion(new VersionImpl(storeName, 1, "test_push_id"));
+          break;
+        case "replaced-version":
+          Version replacement = new VersionImpl(storeName, 1, "replacement-push");
+          replacement.setStatus(STARTED);
+          replacement.setVersionSwapDeferred(true);
+          store.setVersions(Collections.singletonList(replacement));
+          break;
+        case "targeted":
+        case "non-deferred":
+          Version changedVersion = store.getVersion(1).cloneVersion();
+          changedVersion.setTargetSwapRegion(change.equals("targeted") ? "region-a" : "");
+          changedVersion.setVersionSwapDeferred(change.equals("targeted"));
+          store.setVersions(Collections.singletonList(changedVersion));
+          break;
+        case "changed-regions":
+          controllerClients.remove("region-b");
+          break;
+        default:
+          throw new AssertionError("Unexpected change: " + change);
+      }
+      return deferredSwapCurrentVersions(1, 1);
+    }).when(adminSpy).getCurrentVersionsForMultiColos(clusterName, storeName);
+
+    assertTrue(adminSpy.getTopicForCurrentPushJob(clusterName, storeName, false, false).isPresent());
+    verify(resources.getStoreMetadataRepository(), never()).updateStore(any(Store.class));
+  }
+
+  @Test
+  public void testGetTopicForCurrentPushJobDoesNotOverwriteNewerCurrentVersion() {
+    prepareDeferredSwapAdmission(PUSHED);
+    store.setCurrentVersion(2);
+
+    assertTrue(parentAdmin.getTopicForCurrentPushJob(clusterName, storeName, false, false).isPresent());
+    assertEquals(store.getCurrentVersion(), 2);
+    assertEquals(store.getVersionStatus(1), PUSHED);
+    verify(resources.getStoreMetadataRepository(), never()).updateStore(any(Store.class));
+  }
+
+  @DataProvider(name = "manualDeferredSwapQueryFailures")
+  public Object[][] manualDeferredSwapQueryFailures() {
+    return new Object[][] { { "error" }, { "exception" }, { "null-response" }, { "null-store" } };
+  }
+
+  @Test(dataProvider = "manualDeferredSwapQueryFailures")
+  public void testGetTopicForCurrentPushJobDoesNotReconcileFailedQuery(String failure) {
+    prepareDeferredSwapAdmission(PUSHED);
+    ControllerClient client = controllerClients.get("region-b");
+    StoreResponse response = new StoreResponse();
+    if (failure.equals("exception")) {
+      doThrow(new VeniceException("Query failed")).when(client).getStore(storeName);
+    } else if (failure.equals("null-response")) {
+      doReturn(null).when(client).getStore(storeName);
+    } else {
+      if (failure.equals("error")) {
+        response.setError("Query failed");
+      }
+      doReturn(response).when(client).getStore(storeName);
+    }
+
+    if (failure.equals("error")) {
+      assertTrue(parentAdmin.getTopicForCurrentPushJob(clusterName, storeName, false, false).isPresent());
+    } else {
+      Class<? extends Throwable> expectedException =
+          failure.equals("exception") ? VeniceException.class : NullPointerException.class;
+      assertThrows(
+          expectedException,
+          () -> parentAdmin.getTopicForCurrentPushJob(clusterName, storeName, false, false));
+    }
+    assertEquals(store.getVersionStatus(1), PUSHED);
+    assertEquals(store.getCurrentVersion(), 0);
+    verify(resources.getStoreMetadataRepository(), never()).updateStore(any(Store.class));
+  }
+
+  @Test
+  public void testGetTopicForCurrentPushJobPropagatesReconciliationPersistenceFailure() {
+    prepareDeferredSwapAdmission(PUSHED);
+    VeniceException failure = new VeniceException("Persistence failed");
+    ReadWriteStoreRepository repository = resources.getStoreMetadataRepository();
+    doThrow(failure).when(repository).updateStore(any(Store.class));
+    VeniceParentHelixAdmin adminSpy = spy(parentAdmin);
+
+    assertSame(
+        expectThrows(
+            VeniceException.class,
+            () -> adminSpy.getTopicForCurrentPushJob(clusterName, storeName, false, false)),
+        failure);
+    assertEquals(store.getVersionStatus(1), PUSHED);
+    assertEquals(store.getCurrentVersion(), 0);
+    verify(adminSpy).releaseAdminMessageLock(clusterName, storeName);
+  }
+
+  @Test
+  public void testGetTopicForCurrentPushJobRevalidatesLeadership() {
+    prepareDeferredSwapAdmission(PUSHED);
+    VeniceParentHelixAdmin adminSpy = spy(parentAdmin);
+    doAnswer(invocation -> {
+      doThrow(new VeniceException("Leadership changed")).when(internalAdmin)
+          .checkPreConditionForUpdateStoreMetadata(clusterName, storeName);
+      return deferredSwapCurrentVersions(1, 1);
+    }).when(adminSpy).getCurrentVersionsForMultiColos(clusterName, storeName);
+
+    assertThrows(VeniceException.class, () -> adminSpy.getTopicForCurrentPushJob(clusterName, storeName, false, false));
+    assertEquals(store.getVersionStatus(1), PUSHED);
+    assertEquals(store.getCurrentVersion(), 0);
+    verify(resources.getStoreMetadataRepository(), never()).updateStore(any(Store.class));
+    verify(adminSpy).releaseAdminMessageLock(clusterName, storeName);
+  }
+
+  @Test
+  public void testGetTopicForCurrentPushJobReconcilesWithoutHoldingStoreLockDuringQueries() throws Exception {
+    prepareDeferredSwapAdmission(PUSHED);
+    VeniceParentHelixAdmin adminSpy = spy(parentAdmin);
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    doAnswer(invocation -> {
+      executor.submit(() -> {
+        try (AutoCloseableLock ignored = clusterLockManager.createStoreWriteLock(storeName)) {
+          assertEquals(store.getVersionStatus(1), PUSHED);
+        }
+      }).get(5, TimeUnit.SECONDS);
+      return deferredSwapCurrentVersions(1, 1);
+    }).when(adminSpy).getCurrentVersionsForMultiColos(clusterName, storeName);
+
+    // update-store already owns this reentrant lock when it calls the getter.
+    parentAdmin.acquireAdminMessageLock(clusterName, storeName);
+    try {
+      Assert.assertFalse(adminSpy.getTopicForCurrentPushJob(clusterName, storeName, false, false).isPresent());
+    } finally {
+      parentAdmin.releaseAdminMessageLock(clusterName, storeName);
+      executor.shutdownNow();
+    }
+    InOrder order = inOrder(adminSpy, clusterLockManager, resources.getStoreMetadataRepository());
+    order.verify(adminSpy).acquireAdminMessageLock(clusterName, storeName);
+    order.verify(adminSpy).getCurrentVersionsForMultiColos(clusterName, storeName);
+    order.verify(clusterLockManager, times(2)).createStoreWriteLock(storeName);
+    order.verify(resources.getStoreMetadataRepository()).updateStore(any(Store.class));
+    order.verify(adminSpy).releaseAdminMessageLock(clusterName, storeName);
+  }
+
+  @Test(dataProvider = "True-and-False", dataProviderClass = DataProviderUtils.class)
+  public void testIncrementVersionIdempotentRequiresPersistedManualSwap(boolean persistenceFails) {
+    prepareDeferredSwapAdmission(PUSHED);
+    VeniceParentHelixAdmin adminSpy = spy(parentAdmin);
+    doNothing().when(adminSpy).checkNewPushCapacityFromChildren(clusterName, storeName);
+    Version nextVersion = new VersionImpl(storeName, 2, "next-push");
+    doAnswer(invocation -> {
+      assertEquals(store.getVersionStatus(1), ONLINE);
+      assertEquals(store.getCurrentVersion(), 1);
+      return nextVersion;
+    }).when(adminSpy)
+        .addVersionAndTopicOnly(
+            eq(clusterName),
+            eq(storeName),
+            eq("next-push"),
+            anyInt(),
+            anyInt(),
+            anyInt(),
+            any(),
+            anyBoolean(),
+            anyBoolean(),
+            any(),
+            any(),
+            anyLong(),
+            any(),
+            anyBoolean(),
+            any(),
+            anyInt(),
+            anyInt(),
+            anyInt(),
+            anyBoolean());
+    if (persistenceFails) {
+      VeniceException failure = new VeniceException("Persistence failed");
+      ReadWriteStoreRepository repository = resources.getStoreMetadataRepository();
+      doThrow(failure).when(repository).updateStore(any(Store.class));
+      assertSame(
+          expectThrows(
+              VeniceException.class,
+              () -> adminSpy.incrementVersionIdempotent(clusterName, storeName, "next-push", 1, 1)),
+          failure);
+      verify(adminSpy, never()).checkAndRecordPushAttempt(anyString(), anyString(), anyString(), any());
+      assertEquals(store.getVersionStatus(1), PUSHED);
+      assertEquals(store.getCurrentVersion(), 0);
+    } else {
+      assertSame(adminSpy.incrementVersionIdempotent(clusterName, storeName, "next-push", 1, 1), nextVersion);
+    }
+  }
+
+  private Map<String, Integer> deferredSwapCurrentVersions(Integer regionA, Integer regionB) {
+    Map<String, Integer> currentVersions = new HashMap<>();
+    currentVersions.put("region-a", regionA);
+    currentVersions.put("region-b", regionB);
+    return currentVersions;
+  }
+
+  private void prepareDeferredSwapAdmission(VersionStatus status) {
+    store = inProgressStore(storeName, status, true, "");
+    doAnswer(invocation -> store.cloneStore()).when(internalAdmin).getStore(clusterName, storeName);
+    ReadWriteStoreRepository repository = resources.getStoreMetadataRepository();
+    doAnswer(invocation -> store == null ? null : store.cloneStore()).when(repository).getStore(storeName);
+    doAnswer(invocation -> {
+      store = ((Store) invocation.getArgument(0)).cloneStore();
+      return null;
+    }).when(repository).updateStore(any(Store.class));
+    clusterLockManager = spy(new ClusterLockManager(clusterName));
+    doReturn(clusterLockManager).when(resources).getClusterLockManager();
+    controllerClients.clear();
+    for (String region: Arrays.asList("region-a", "region-b")) {
+      ControllerClient client = mock(ControllerClient.class);
+      StoreInfo info = new StoreInfo();
+      info.setCurrentVersion(1);
+      StoreResponse response = new StoreResponse();
+      response.setStore(info);
+      doReturn(response).when(client).getStore(storeName);
+      controllerClients.put(region, client);
+    }
+  }
+
   private Store inProgressStore(String storeName, VersionStatus status) {
+    return inProgressStore(storeName, status, false, "");
+  }
+
+  private Store inProgressStore(
+      String storeName,
+      VersionStatus status,
+      boolean versionSwapDeferred,
+      String targetSwapRegion) {
     Store store = new ZKStore(
         storeName,
         "test_owner",
@@ -3869,6 +4252,8 @@ public class TestVeniceParentHelixAdmin extends AbstractTestVeniceParentHelixAdm
         1);
     VersionImpl version = new VersionImpl(storeName, 1, "test_push_id");
     version.setStatus(status);
+    version.setVersionSwapDeferred(versionSwapDeferred);
+    version.setTargetSwapRegion(targetSwapRegion);
     store.addVersion(version);
     return store;
   }

@@ -1375,7 +1375,8 @@ public class VeniceParentHelixAdmin implements Admin {
    * else will return the ongoing Kafka topic.
    *
    * <p>Note: {@code isIncrementalPush} and {@code isRepush} are accepted for interface/call-site compatibility but
-   * are not used by this parent-controller implementation, which relies solely on parent version status.
+   * are not used by this parent-controller implementation. A completed manual deferred swap may reconcile
+   * parent metadata here after verifying the current version in every configured child region.
    */
   public Optional<String> getTopicForCurrentPushJob(
       String clusterName,
@@ -1414,8 +1415,9 @@ public class VeniceParentHelixAdmin implements Admin {
     // status alone (not the parent VT, which may never exist under PARENT_VERSION_STATUS_ONLY).
     // - NOT_CREATED: no real version (also the rolling-deployment fallback for an unrecognized status
     // id, see VersionStatus#getVersionStatusFromInt); documented to be inert and non-blocking.
-    // CREATED/PUSHED block the next push outright. STARTED can still represent a normal push whose
+    // CREATED blocks the next push outright. STARTED can still represent a normal push whose
     // current-version promotion has already completed but whose parent version status has not caught up.
+    // Manual deferred STARTED/PUSHED versions require verified completion and parent metadata reconciliation.
     switch (lastVersion.getStatus()) {
       case KILLED:
       case ERROR:
@@ -1432,6 +1434,12 @@ public class VeniceParentHelixAdmin implements Admin {
       default:
         // Non-terminal — fall through to the block-the-next-push branch below.
         break;
+    }
+
+    if ((lastVersion.getStatus() == STARTED || lastVersion.getStatus() == PUSHED) && lastVersion.isVersionSwapDeferred()
+        && StringUtils.isEmpty(lastVersion.getTargetSwapRegion())
+        && reconcileCompletedManualDeferredSwap(clusterName, store, lastVersion)) {
+      return Optional.empty();
     }
 
     if (lastVersion.getStatus() == STARTED && !lastVersion.isVersionSwapDeferred()) {
@@ -1469,6 +1477,56 @@ public class VeniceParentHelixAdmin implements Admin {
         storeName,
         lastVersion.getStatus());
     return Optional.of(Version.composeKafkaTopic(storeName, lastVersionNum));
+  }
+
+  private boolean reconcileCompletedManualDeferredSwap(String clusterName, Store store, Version version) {
+    String storeName = store.getName();
+    int versionNumber = version.getNumber();
+    acquireAdminMessageLock(clusterName, storeName);
+    try {
+      getVeniceHelixAdmin().checkPreConditionForUpdateStoreMetadata(clusterName, storeName);
+      Set<String> expectedRegions = new HashSet<>(getVeniceHelixAdmin().getControllerClientMap(clusterName).keySet());
+      if (expectedRegions.isEmpty()) {
+        return false;
+      }
+      // Serialize with roll-forward/rollback, but do not hold the metadata write lock across child RPCs.
+      Map<String, Integer> currentVersions = getCurrentVersionsForMultiColos(clusterName, storeName);
+      if (currentVersions == null || !currentVersions.keySet().equals(expectedRegions)
+          || !currentVersions.values()
+              .stream()
+              .allMatch(currentVersion -> Objects.equals(currentVersion, versionNumber))) {
+        return false;
+      }
+
+      HelixVeniceClusterResources resources = getVeniceHelixAdmin().getHelixVeniceClusterResources(clusterName);
+      try (AutoCloseableLock ignore = resources.getClusterLockManager().createStoreWriteLock(storeName)) {
+        getVeniceHelixAdmin().checkPreConditionForUpdateStoreMetadata(clusterName, storeName);
+        ReadWriteStoreRepository repository = resources.getStoreMetadataRepository();
+        Store parentStore = repository.getStore(storeName);
+        if (parentStore == null || parentStore.getCreatedTime() != store.getCreatedTime()
+            || parentStore.getLargestUsedVersionNumber() != versionNumber
+            || parentStore.getCurrentVersion() != store.getCurrentVersion()
+            || parentStore.getCurrentVersion() > versionNumber
+            || !getVeniceHelixAdmin().getControllerClientMap(clusterName).keySet().equals(expectedRegions)) {
+          return false;
+        }
+        Version parentVersion = parentStore.getVersion(versionNumber);
+        if (parentVersion == null || parentVersion.getStatus() != version.getStatus()
+            || parentVersion.getCreatedTime() != version.getCreatedTime()
+            || !Objects.equals(parentVersion.getPushJobId(), version.getPushJobId())
+            || !parentVersion.isVersionSwapDeferred() || StringUtils.isNotEmpty(parentVersion.getTargetSwapRegion())) {
+          return false;
+        }
+        parentStore.updateVersionStatus(versionNumber, ONLINE);
+        if (parentStore.getCurrentVersion() != versionNumber) {
+          parentStore.setCurrentVersion(versionNumber);
+        }
+        repository.updateStore(parentStore);
+        return true;
+      }
+    } finally {
+      releaseAdminMessageLock(clusterName, storeName);
+    }
   }
 
   /**
